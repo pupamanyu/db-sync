@@ -6,5 +6,5 @@ DB Migration Spark Job using Cloud Dataproc :
 - Incremental Sync based on Numeric Column
 - Uses Externalized HOCON/JSON file for configuration
 
-Supported Databases List :
+Supported List of Databases :
 - MySQL
