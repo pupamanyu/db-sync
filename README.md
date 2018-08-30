@@ -31,11 +31,12 @@ To Configure the Migration Job:
        ```
 
 To Run the Migration Job:
-*  Modify the scripts below:
-  * create-internal-cluster.sh
-  * run-job.sh
-  * delete-cluster.sh
+
+* Download and modify the scripts below:
+  1. create-internal-cluster.sh
+  2. run-job.sh
+  3. delete-cluster.sh
 * Execute:
-  ```bash
+  * ```bash
     create-internal-cluster.sh && run-job.sh && delete-cluster.sh
     ```
