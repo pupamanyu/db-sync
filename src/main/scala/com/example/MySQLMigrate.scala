@@ -70,7 +70,7 @@ object MySQLMigrate {
       .read
       .jdbc(jdbcUrl, sqlQuery, connectionProps)
       .head()
-      .getDecimal(0)
+      .getInt(0)
       .longValue()
   }
 
@@ -85,7 +85,7 @@ object MySQLMigrate {
       .read
       .jdbc(jdbcUrl, sqlQuery, connectionProps)
       .head()
-      .getDecimal(0)
+      .getInt(0)
       .longValue()
   }
 
@@ -99,7 +99,9 @@ object MySQLMigrate {
     spark.sqlContext
       .read
       .jdbc(jdbcUrl, sqlQuery, connectionProps)
-      .head().getLong(0).longValue()
+      .head()
+      .getLong(0)
+      .longValue()
   }
 
   /**
@@ -154,7 +156,7 @@ object MySQLMigrate {
     if (srcRowCount == destRowCount) {
       log.info(s"Source and Destination DB row counts match. Total Rows $destRowCount")
     } else {
-      log.warn(s"Destination Row Count $destRowCount does not match Source Row Count $srcRowCount")
+      log.error(s"Destination Row Count $destRowCount does not match Source Row Count $srcRowCount")
     }
   }
 
