@@ -25,6 +25,7 @@ import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.sql._
 import com.typesafe.config._
 import scala.collection.JavaConverters._
+import org.apache.spark.storage.StorageLevel
 
 import scala.util.Try
 
@@ -172,7 +173,7 @@ object MySQLMigrate {
     destConnectionProps.put("password", config.getString("target.password"))
     destConnectionProps.put("driver", config.getString("target.driver"))
 
-    val inputRows = srcSqlDF.count()
+    srcSqlDF.persist(StorageLevel.MEMORY_AND_DISK)
     val load = Try(srcSqlDF
       .write
       .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("target.driver"))
@@ -182,7 +183,7 @@ object MySQLMigrate {
       .mode(SaveMode.Append)
       .jdbc(config.getString("target.jdbcUrl"), config.getString("target.table"), destConnectionProps))
     if (load.isSuccess) {
-      log.info(s"""Successfully Loaded $inputRows Rows into the table ${config.getString("target.table")} at ${config.getString("target.jdbcUrl")}""")
+      log.info(s"""Successfully Loaded ${srcSqlDF.count()} Rows into the table ${config.getString("target.table")} at ${config.getString("target.jdbcUrl")}""")
     } else {
       log.error(s"Exceptions encountered ${load.failed.get.getMessage}")
     }
