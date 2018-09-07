@@ -46,6 +46,10 @@ object MySQLMigrate {
     srcConnectionProps.put("password", config.getString("source.password"))
     srcConnectionProps.put("driver", config.getString("source.driver"))
 
+    val numPartitions = getNumPartitions(spark, config)
+
+    log.info(s"""Setting the number of the partitions to $numPartitions based on the source table""")
+
     val jdbcDF = spark.read
       .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("source.driver"))
       .option(JDBCOptions.JDBC_TABLE_NAME, config.getString("source.table"))
@@ -53,7 +57,7 @@ object MySQLMigrate {
       .option(JDBCOptions.JDBC_PARTITION_COLUMN, config.getString("source.partitionColumn"))
       .option(JDBCOptions.JDBC_LOWER_BOUND, lowerBound)
       .option(JDBCOptions.JDBC_UPPER_BOUND, upperBound)
-      .option(JDBCOptions.JDBC_NUM_PARTITIONS, config.getInt("source.numPartitions"))
+      .option(JDBCOptions.JDBC_NUM_PARTITIONS, numPartitions)
       .jdbc(config.getString("source.jdbcUrl"), config.getString("source.table"), srcConnectionProps)
       .where(s"""${config.getString("source.partitionColumn")} >= $lowerBound""")
     log.info(s"""Successfully Extracted data from table ${config.getString("source.table")} at ${config.getString("source.jdbcUrl")}""")
@@ -97,6 +101,31 @@ object MySQLMigrate {
     */
   def getRowCount: (SparkSession, String, String, String, Properties) => Long = { (spark: SparkSession, jdbcUrl: String, table: String, column: String, connectionProps: Properties) =>
     val sqlQuery = s"""(SELECT COUNT(CONCAT($column)) as rowcount from $table) as t"""
+    spark.sqlContext
+      .read
+      .jdbc(jdbcUrl, sqlQuery, connectionProps)
+      .head()
+      .getLong(0)
+      .longValue()
+  }
+
+  /**
+    * Get the Number of Partitions based on the Partition Column
+    *
+    * @return
+    */
+  def getNumPartitions: (SparkSession, Config) => Long = { (spark: SparkSession, config: Config) =>
+    val connectionProps = new Properties()
+    connectionProps.put("user", config.getString("source.user"))
+    connectionProps.put("password", config.getString("source.password"))
+    connectionProps.put("driver", config.getString("source.driver"))
+
+    val column = config.getString("source.partitionColumn")
+    val table = config.getString("source.table")
+    val jdbcUrl = config.getString("source.jdbcUrl")
+    val (lowerBound, _) = getBounds(spark, config)
+
+    val sqlQuery = s"(SELECT COUNT(distinct $column) AS num_partitions_$column FROM $table where $column >= $lowerBound) as t"
     spark.sqlContext
       .read
       .jdbc(jdbcUrl, sqlQuery, connectionProps)
@@ -173,18 +202,15 @@ object MySQLMigrate {
     destConnectionProps.put("password", config.getString("target.password"))
     destConnectionProps.put("driver", config.getString("target.driver"))
 
-    srcSqlDF.persist(StorageLevel.MEMORY_AND_DISK)
-    val inputRows = srcSqlDF.count()
     val load = Try(srcSqlDF
       .write
       .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("target.driver"))
       .option(JDBCOptions.JDBC_TABLE_NAME, config.getString("target.table"))
       .option(JDBCOptions.JDBC_BATCH_INSERT_SIZE, config.getInt("target.batchInsertSize"))
-      .option(JDBCOptions.JDBC_NUM_PARTITIONS, config.getInt("target.numPartitions"))
       .mode(SaveMode.Append)
       .jdbc(config.getString("target.jdbcUrl"), config.getString("target.table"), destConnectionProps))
     if (load.isSuccess) {
-      log.info(s"""Successfully Loaded $inputRows Rows into the table ${config.getString("target.table")} at ${config.getString("target.jdbcUrl")}""")
+      log.info(s"""Successfully Loaded ${srcSqlDF.count()} Rows into the table ${config.getString("target.table")} at ${config.getString("target.jdbcUrl")}""")
     } else {
       log.error(s"Exceptions encountered ${load.failed.get.getMessage}")
     }
