@@ -29,12 +29,16 @@ lazy val mysqlVersion = "8.0.12"
 
 lazy val configVersion = "1.3.2"
 
+lazy val cloudSQLSocketFactoryVersion = "1.0.10"
+
+
 // https://mvnrepository.com/artifact/org.apache.spark/spark-core
 // https://mvnrepository.com/artifact/mysql/mysql-connector-java
 libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-core" % sparkVersion % "provided",
   "org.apache.spark" %% "spark-sql" % sparkVersion % "provided",
   "mysql" % "mysql-connector-java" % mysqlVersion,
-  "com.typesafe" % "config" % configVersion
+  "com.typesafe" % "config" % configVersion,
+  //"com.google.cloud.sql" % "mysql-socket-factory-connector-j-8" % cloudSQLSocketFactoryVersion
 )
 resolvers += Resolver.mavenLocal

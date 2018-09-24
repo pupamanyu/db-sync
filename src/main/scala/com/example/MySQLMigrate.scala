@@ -26,6 +26,9 @@ import org.apache.spark.sql._
 import com.typesafe.config._
 import scala.collection.JavaConverters._
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.sql.functions._
+import scala.math.{min => Mathmin, max => Mathmax}
+
 
 import scala.util.Try
 
@@ -48,20 +51,52 @@ object MySQLMigrate {
 
     val numPartitions = getNumPartitions(spark, config)
 
-    log.info(s"""Setting the number of the partitions to $numPartitions based on the source table""")
+    val (lowerBound, upperBound) = getBounds(spark, config)
 
-    val jdbcDF = spark.read
-      .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("source.driver"))
-      .option(JDBCOptions.JDBC_TABLE_NAME, config.getString("source.table"))
-      .option(JDBCOptions.JDBC_BATCH_FETCH_SIZE, config.getInt("source.batchFetchSize"))
-      .option(JDBCOptions.JDBC_PARTITION_COLUMN, config.getString("source.partitionColumn"))
-      .option(JDBCOptions.JDBC_LOWER_BOUND, lowerBound)
-      .option(JDBCOptions.JDBC_UPPER_BOUND, upperBound)
-      .option(JDBCOptions.JDBC_NUM_PARTITIONS, numPartitions)
-      .jdbc(config.getString("source.jdbcUrl"), config.getString("source.table"), srcConnectionProps)
-      .where(s"""${config.getString("source.partitionColumn")} >= $lowerBound""")
-    log.info(s"""Successfully Extracted data from table ${config.getString("source.table")} at ${config.getString("source.jdbcUrl")}""")
-    jdbcDF
+    val extractDF = config.getString("source.extractType") match { 
+      case "full" | "incremental" => 
+        spark.read
+          .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("source.driver"))
+          .option(JDBCOptions.JDBC_BATCH_FETCH_SIZE, config.getInt("source.batchFetchSize"))
+          .option(JDBCOptions.JDBC_TABLE_NAME, config.getString("source.table"))
+          .option(JDBCOptions.JDBC_NUM_PARTITIONS, numPartitions)
+          .option(JDBCOptions.JDBC_PARTITION_COLUMN, config.getString("source.partitionColumn"))
+          .option(JDBCOptions.JDBC_LOWER_BOUND, lowerBound)
+          .option(JDBCOptions.JDBC_UPPER_BOUND, upperBound)
+          .jdbc(url=config.getString("source.jdbcUrl"), table=config.getString("source.table"), properties=srcConnectionProps)
+          .persist(StorageLevel.MEMORY_AND_DISK_SER)
+      case "custom" =>
+        val srcTable = s"""(SELECT * FROM ${config.getString("source.table")} WHERE ${config.getString("source.partitionColumn")} BETWEEN $lowerBound AND $upperBound) srcTable"""
+        spark.read
+          .option(JDBCOptions.JDBC_DRIVER_CLASS, config.getString("source.driver"))
+          .option(JDBCOptions.JDBC_BATCH_FETCH_SIZE, config.getInt("source.batchFetchSize"))
+          .option(JDBCOptions.JDBC_NUM_PARTITIONS, numPartitions)
+          .option(JDBCOptions.JDBC_PARTITION_COLUMN, config.getString("source.partitionColumn"))
+          .option(JDBCOptions.JDBC_LOWER_BOUND, lowerBound)
+          .option(JDBCOptions.JDBC_UPPER_BOUND, upperBound)
+          .jdbc(url=config.getString("source.jdbcUrl"), table=srcTable, properties=srcConnectionProps)
+          .persist(StorageLevel.MEMORY_AND_DISK_SER)
+    }
+
+    val minPartitions = config.getInt("source.numPartitions")
+    val extractPartitions = extractDF.rdd.getNumPartitions
+    log.info(s"""Extracted Source Dataframe Partition Counts : $extractPartitions""")
+
+    if (config.hasPath("target.sourceDFRepartition") && config.getBoolean("target.sourceDFRepartition")) {
+      log.warn(s"""Found Source Repartition Config set to true. Repartition may cause job performance degradation.""")
+      if (extractPartitions > minPartitions) {
+        log.warn(s"""Coalesceing the number of the partitions to $minPartitions from $extractPartitions""")
+        extractDF.coalesce(minPartitions.toInt)
+      } else if (extractPartitions < minPartitions) {
+        log.warn(s"""Repartitioning the number of the partitions to $minPartitions from $extractPartitions""")
+        extractDF.repartition(minPartitions.toInt)
+      } else {
+        log.warn(s"""Coalesceing/Repartitioning not needed""")
+        extractDF
+      }
+    } else {
+      extractDF
+    }
   }
 
   /**
@@ -99,14 +134,31 @@ object MySQLMigrate {
     *
     * @return
     */
-  def getRowCount: (SparkSession, String, String, String, Properties) => Long = { (spark: SparkSession, jdbcUrl: String, table: String, column: String, connectionProps: Properties) =>
-    val sqlQuery = s"""(SELECT COUNT(CONCAT($column)) as rowcount from $table) as t"""
+  def getRowCount: (SparkSession, String, String, Config, Properties) => Long = { (spark: SparkSession, jdbcUrl: String, table: String, config: Config, connectionProps: Properties) =>
+    // Concat the Primary Columns into comma separated String for the Row Count
+    val primaryColumns = config.getStringList("source.primaryColumns").asScala.toList.mkString(",")
+    val partitionColumn = config.getString("source.partitionColumn")
+    val (lowerBound, upperBound) = getBounds(spark, config)
+    val sqlQuery = s"""(SELECT COUNT(CONCAT($primaryColumns)) AS rowcount FROM $table WHERE $partitionColumn >= $lowerBound AND $partitionColumn <= $upperBound) as t"""
     spark.sqlContext
       .read
       .jdbc(jdbcUrl, sqlQuery, connectionProps)
       .head()
       .getLong(0)
       .longValue()
+  }
+
+  /**
+    * Get the Row Count by Group of a Table
+    *
+    * @return
+    */
+  def getGroupCounts: (SparkSession, String, String, String, Properties) => sql.DataFrame = { (spark: SparkSession, jdbcUrl: String, table: String, column: String, connectionProps: Properties) =>
+    val sqlQuery = s"""(SELECT $column, COUNT($column) as rowcount from $table GROUP BY $column ORDER BY $column) as t"""
+    spark.sqlContext
+      .read
+      .jdbc(jdbcUrl, sqlQuery, connectionProps)
+      .toDF()
   }
 
   /**
@@ -123,15 +175,16 @@ object MySQLMigrate {
     val column = config.getString("source.partitionColumn")
     val table = config.getString("source.table")
     val jdbcUrl = config.getString("source.jdbcUrl")
-    val (lowerBound, _) = getBounds(spark, config)
+    val minPartitions = config.getLong("source.numPartitions")
+    val (lowerBound, upperBound) = getBounds(spark, config)
 
-    val sqlQuery = s"(SELECT COUNT(distinct $column) AS num_partitions_$column FROM $table where $column >= $lowerBound) as t"
+    val sqlQuery = s"(SELECT COUNT(distinct $column) AS num_partitions_$column FROM $table WHERE $column BETWEEN $lowerBound AND $upperBound) as t"
     spark.sqlContext
-      .read
-      .jdbc(jdbcUrl, sqlQuery, connectionProps)
-      .head()
-      .getLong(0)
-      .longValue()
+        .read
+        .jdbc(jdbcUrl, sqlQuery, connectionProps)
+        .head()
+        .getLong(0)
+        .longValue()
   }
 
   /**
@@ -149,15 +202,33 @@ object MySQLMigrate {
     destConnectionProps.put("user", config.getString("target.user"))
     destConnectionProps.put("password", config.getString("target.password"))
     destConnectionProps.put("driver", config.getString("target.driver"))
-
-    config.getString("source.extractType") match {
+    
+    val lowerBound = config.getString("source.extractType") match {
       case "full" =>
-        (getMin(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), config.getString("source.partitionColumn"), srcConnectionProps),
-          getMax(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), config.getString("source.partitionColumn"), srcConnectionProps))
+        getMin(spark, config.getString("source.jdbcUrl"),
+          config.getString("source.table"),
+          config.getString("source.partitionColumn"),
+          srcConnectionProps)
+
       case "incremental" =>
-        (getMax(spark, config.getString("target.jdbcUrl"), config.getString("target.table"), config.getString("source.partitionColumn"), destConnectionProps) + 1,
-          getMax(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), config.getString("source.partitionColumn"), srcConnectionProps))
+        getMax(spark,
+          config.getString("target.jdbcUrl"),
+          config.getString("target.table"),
+          config.getString("source.partitionColumn"), destConnectionProps) + 1
+
+      case "custom" => config.getLong("source.lowerBound")
     }
+    
+    val upperBound = 
+      if (config.hasPath("source.upperBound")) 
+        config.getLong("source.upperBound") 
+      else 
+        getMax(spark, 
+          config.getString("source.jdbcUrl"), 
+          config.getString("source.table"), 
+          config.getString("source.partitionColumn"), srcConnectionProps)
+    
+    (lowerBound, upperBound)
   }
 
 
@@ -180,13 +251,70 @@ object MySQLMigrate {
     // Concat the Primary Columns into comma separated String for the Row Count
     val primaryColumns = config.getStringList("source.primaryColumns").asScala.toList.mkString(",")
 
-    val srcRowCount = getRowCount(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), primaryColumns, srcConnectionProps)
-    val destRowCount = getRowCount(spark, config.getString("target.jdbcUrl"), config.getString("target.table"), primaryColumns, destConnectionProps)
+    val srcRowCount = getRowCount(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), config, srcConnectionProps)
+    val destRowCount = getRowCount(spark, config.getString("target.jdbcUrl"), config.getString("target.table"), config, destConnectionProps)
 
     if (srcRowCount == destRowCount) {
-      log.info(s"Source and Destination DB row counts match. Total Rows $destRowCount")
+      log.info(s"""Source and Destination DB row counts match.
+        Total Rows Loaded into Destination DB: $destRowCount""")
     } else {
       log.error(s"Destination Row Count $destRowCount does not match Source Row Count $srcRowCount")
+    }
+  }
+
+  /**
+    * Verify the Diff of Row Counts between the Source and Target Tables
+    * @return
+    */
+  def verifyGroupCounts: (SparkSession, Config) => Unit = { (spark: SparkSession, config: Config) =>
+
+    val srcConnectionProps = new Properties()
+    srcConnectionProps.put("user", config.getString("source.user"))
+    srcConnectionProps.put("password", config.getString("source.password"))
+    srcConnectionProps.put("driver", config.getString("source.driver"))
+
+    val destConnectionProps = new Properties()
+    destConnectionProps.put("user", config.getString("target.user"))
+    destConnectionProps.put("password", config.getString("target.password"))
+    destConnectionProps.put("driver", config.getString("target.driver"))
+
+    val partitionColumn = config.getString("source.partitionColumn")
+    val srcGroupCount = getGroupCounts(spark, config.getString("source.jdbcUrl"), config.getString("source.table"), partitionColumn, srcConnectionProps)
+    val destGroupCount = getGroupCounts(spark, config.getString("target.jdbcUrl"), config.getString("target.table"), partitionColumn, destConnectionProps)
+
+    val mismatchedDF = 
+      srcGroupCount
+        .join(destGroupCount, Seq(partitionColumn), "inner")
+        .toDF(partitionColumn, "srcCounts", "destCounts")
+        .filter("srcCounts <> destCounts")
+
+    val mismatchedFirst = 
+      mismatchedDF
+        .agg(min(col(partitionColumn)))
+        .limit(1)
+        .head
+
+    val missedDF = 
+      srcGroupCount
+        .join(destGroupCount, Seq(partitionColumn), "left_outer")
+        .toDF(partitionColumn, "srcCounts", "destCounts")
+        .filter(col("destcounts").isNull)
+
+    val missedFirst = 
+      missedDF
+        .agg(min(col(partitionColumn)))
+        .limit(1)
+        .head
+
+    if (mismatchedFirst.isNullAt(0)) {
+      log.info(s"""Row Counts Match for ingested $partitionColumn column""")
+    } else {
+      log.error(s"""Row Counts Mismatch Found. $partitionColumn Row Counts Mismatched starting at $partitionColumn = ${mismatchedFirst}""")
+    }
+    if (missedFirst.isNullAt(0)) {
+      log.info(s"""There are no Missing $partitionColumn column values""")
+    } else {
+      log.error(s"""Missing $partitionColumn Found. First Missing $partitionColumn starting at $partitionColumn = ${missedFirst}""")
     }
   }
 
@@ -256,6 +384,9 @@ object MySQLMigrate {
       .config(sparkConf)
       .getOrCreate()
 
+    // Import Implicits
+    import spark.implicits._
+
     // Load Config JSON File from the GCS Location provides as the first argument
     ConfigFactory.invalidateCaches()
 
@@ -290,9 +421,18 @@ object MySQLMigrate {
       log.warn(s"""Source DB may not have any updates since the last DB Sync.
            | Maximum Value for ${config.getString("source.partitionColumn")} is same between Source DB and Target DB""".stripMargin)
     } else {
-      // Extract and Load Data from Source to Target
-      loadDBFn(extractDBFn(config))
-      verifyRowCounts(spark, config)
+      val loaded = Try(loadDBFn(extractDBFn(config)))
+
+      if (loaded.isFailure) {
+        log.fatal(s"""Failed to Load the data: ${loaded.failed.get}""")
+      } else {
+        log.info(s"""Successfully Loaded data from table ${config.getString("source.table")} at ${config.getString("source.jdbcUrl")}""")
+        verifyRowCounts(spark, config)
+      }
+      if (config.hasPath("target.verify") && config.getBoolean("target.verify")) {
+        log.info(s"""Verifying the individual ${config.getString("source.partitionColumn")} counts""")
+        verifyGroupCounts(spark, config)
+      }
     }
     spark.stop()
   }
